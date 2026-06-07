@@ -54,6 +54,11 @@ RAW_DIR = DOCUMENTS_DIR / "raw"
 CLEAN_DIR = DOCUMENTS_DIR / "clean"
 OUTPUT_FILE = ROOT / "chunks.jsonl"
 
+# Milestone 4 — embedding + vector store (planning.md → Retrieval Approach)
+CHROMA_DIR = ROOT / "chroma_db"     # ChromaDB persists the index here
+COLLECTION_NAME = "housing"
+TOP_K = 4                           # chunks returned per query
+
 # all-MiniLM-L6-v2 truncates inputs to this many tokens at embedding time;
 # text past it in a chunk will NOT be embedded. See the warning at the end.
 MODEL_MAX_TOKENS = 256
@@ -357,11 +362,8 @@ def preview_chunks(chunks: list[Chunk], n: int = 5) -> None:
 
 # --- 5. Driver ------------------------------------------------------------- #
 
-def main() -> None:
-    # Windows consoles default to cp1252 and choke on characters like "→"
-    # that appear in page text; force UTF-8 output.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
+def run_ingest() -> None:
+    """Milestone 3 — fetch, clean, chunk, and write chunks.jsonl."""
     print("Loading tokenizer ...")
     tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL)
 
@@ -412,6 +414,158 @@ def main() -> None:
             f"embedded. Consider setting CHUNK_SIZE = 256 (overlap ~40) and "
             f"updating planning.md if retrieval quality looks weak."
         )
+
+
+# --- 6. Embedding + vector store (Milestone 4) ----------------------------- #
+#
+# Pipeline diagram stages 3 & 4:
+#   chunks.jsonl --[all-MiniLM-L6-v2]--> embeddings --[ChromaDB]--> index
+#                                                    query --[top-k]--> chunks
+#
+# sentence-transformers and chromadb are imported lazily inside these functions
+# so the ingestion stage above still runs even if the vector-store libraries
+# aren't importable yet.
+
+_model = None  # cache the SentenceTransformer so we load it only once
+
+
+def get_model():
+    """Load all-MiniLM-L6-v2 once (local, no API key, no rate limits)."""
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        print(f"Loading embedding model {EMBED_MODEL} ...")
+        _model = SentenceTransformer(EMBED_MODEL)
+    return _model
+
+
+def _load_chunks() -> list[dict]:
+    if not OUTPUT_FILE.exists():
+        raise SystemExit("chunks.jsonl not found — run `python app.py ingest` first.")
+    with OUTPUT_FILE.open(encoding="utf-8") as f:
+        return [json.loads(line) for line in f]
+
+
+def run_index() -> None:
+    """Embed every chunk and (re)build the ChromaDB collection.
+
+    Each record stores the chunk text, its embedding, and metadata
+    (source document name + position in that document) needed for
+    attribution later."""
+    import chromadb
+
+    chunks = _load_chunks()
+    model = get_model()
+
+    print(f"Embedding {len(chunks)} chunks ...")
+    # normalize_embeddings=True pairs with the collection's cosine space so
+    # the distances ChromaDB returns are cosine distances (0 = identical).
+    embeddings = model.encode(
+        [c["text"] for c in chunks],
+        normalize_embeddings=True,
+        show_progress_bar=True,
+    ).tolist()
+
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    # Rebuild from scratch so re-running never duplicates or stales records.
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    collection = client.create_collection(
+        COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+
+    collection.add(
+        ids=[c["chunk_id"] for c in chunks],
+        documents=[c["text"] for c in chunks],
+        embeddings=embeddings,
+        metadatas=[{"source": c["source"], "chunk_index": c["chunk_index"]}
+                   for c in chunks],
+    )
+    print(f"Indexed {collection.count()} chunks into ChromaDB at "
+          f"{CHROMA_DIR.name}/ (collection '{COLLECTION_NAME}').")
+
+
+def retrieve(query: str, k: int = TOP_K) -> list[dict]:
+    """Return the top-k most relevant chunks for a query, each with its
+    source name, position, and cosine distance (lower = more relevant)."""
+    import chromadb
+
+    model = get_model()
+    query_embedding = model.encode([query], normalize_embeddings=True).tolist()
+
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    collection = client.get_collection(COLLECTION_NAME)
+    res = collection.query(query_embeddings=query_embedding, n_results=k)
+
+    # Chroma returns parallel lists wrapped one level deep (one per query).
+    results = []
+    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
+                               res["distances"][0]):
+        results.append({
+            "text": doc,
+            "source": meta["source"],
+            "chunk_index": meta["chunk_index"],
+            "distance": dist,
+        })
+    return results
+
+
+# Three of the five evaluation-plan queries from planning.md.
+TEST_QUERIES = [
+    "What is a realistic monthly rent range for off-campus student housing, "
+    "and what costs beyond base rent should I budget for?",
+    "What are concrete tips for getting along with roommates in shared "
+    "student housing?",
+    "How can I tell whether an off-campus housing option is safe?",
+]
+
+
+def run_test(k: int = TOP_K) -> None:
+    """Run sample queries and print returned chunks + distance scores so we
+    can judge whether retrieval is actually on-topic."""
+    for query in TEST_QUERIES:
+        print("\n" + "=" * 70)
+        print(f"QUERY: {query}")
+        print("=" * 70)
+        for r in retrieve(query, k=k):
+            flag = "  <-- weak match (>0.6)" if r["distance"] > 0.6 else ""
+            print(f"\n[distance {r['distance']:.3f}] "
+                  f"{r['source']}#{r['chunk_index']}{flag}")
+            snippet = r["text"][:280].replace("\n", " ")
+            print(f"  {snippet}{'...' if len(r['text']) > 280 else ''}")
+
+
+# --- 7. Command dispatch --------------------------------------------------- #
+
+def main() -> None:
+    # Windows consoles default to cp1252 and choke on characters like "→"
+    # that appear in page/chunk text; force UTF-8 output.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+    if cmd == "ingest":          # Milestone 3 only
+        run_ingest()
+    elif cmd == "index":         # Milestone 4: embed + store
+        run_index()
+    elif cmd == "test":          # Milestone 4: retrieval sanity check
+        run_test()
+    elif cmd == "query":         # ad-hoc: python app.py query "your question"
+        if len(sys.argv) < 3:
+            raise SystemExit('Usage: python app.py query "your question here"')
+        for r in retrieve(sys.argv[2]):
+            print(f"[{r['distance']:.3f}] {r['source']}#{r['chunk_index']}")
+            print(f"  {r['text'][:280]}\n")
+    elif cmd == "all":           # full pipeline: ingest -> index -> test
+        run_ingest()
+        print("\n" + "#" * 70 + "\n# EMBEDDING + INDEXING\n" + "#" * 70)
+        run_index()
+        print("\n" + "#" * 70 + "\n# RETRIEVAL TEST\n" + "#" * 70)
+        run_test()
+    else:
+        raise SystemExit(f"Unknown command '{cmd}'. "
+                         "Use: ingest | index | test | query | all")
 
 
 if __name__ == "__main__":
