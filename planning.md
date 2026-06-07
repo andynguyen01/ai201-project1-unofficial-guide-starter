@@ -40,11 +40,13 @@ I want to do off campus housing price. I picked the topic about the off campus h
      numbers fit the structure of your documents.
      A review-heavy corpus warrants different chunking than a long FAQ. -->
 
-**Chunk size:** 500 tokens 
+**Chunk size:** 230 tokens *(revised down from 500 during implementation — see below)*
 
-**Overlap:** 75 tokens 
+**Overlap:** 35 tokens *(~15%, revised from 75)*
 
-**Reasoning:** My corpus is mostly long-form guide articles organized as discrete tips (pricing, safety, roommates). A 500-token chunk is large enough to hold one complete tip with its supporting detail, but small enough that a retrieved chunk stays on a single topic rather than mixing, e.g., safety advice with rent estimates. The 75-token (~15%) overlap carries a sentence or two across chunk boundaries so tips split mid-list or mid-paragraph don't lose context. Where possible I split on paragraph/heading boundaries before packing to 500 tokens, since my Reddit source (r/uofmn) has short, self-contained posts that fixed-size chunking could otherwise merge.
+**Reasoning:** My corpus is mostly long-form guide articles organized as discrete tips (pricing, safety, roommates), so I chunk paragraph-aware: whole paragraphs are packed together up to the token limit rather than cut mid-sentence, which keeps each tip intact and on a single topic. The ~15% overlap carries a sentence or two across chunk boundaries so a tip split mid-list doesn't lose context.
+
+*Revision during implementation:* I originally specified 500-token chunks, but my embedding model, all-MiniLM-L6-v2, truncates any input longer than 256 tokens — so with 500-token chunks roughly the back half of every chunk would never be embedded, and retrieval would silently ignore it. I lowered chunk size to **230 tokens** (with ~35-token overlap) to stay safely under the 256-token limit, leaving headroom for the model's special tokens. Every token in every chunk now gets embedded, and the smaller chunks give tighter, more topically-focused retrieval. Token counts are measured with the all-MiniLM-L6-v2 tokenizer itself, so "tokens" here mean exactly what they mean at embedding time.
 
 ---
 
