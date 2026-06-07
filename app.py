@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -54,13 +55,18 @@ RAW_DIR = DOCUMENTS_DIR / "raw"
 CLEAN_DIR = DOCUMENTS_DIR / "clean"
 OUTPUT_FILE = ROOT / "chunks.jsonl"
 
-# Milestone 4 — embedding + vector store (planning.md → Retrieval Approach)
 CHROMA_DIR = ROOT / "chroma_db"     # ChromaDB persists the index here
 COLLECTION_NAME = "housing"
 TOP_K = 4                           # chunks returned per query
 
-# all-MiniLM-L6-v2 truncates inputs to this many tokens at embedding time;
-# text past it in a chunk will NOT be embedded. See the warning at the end.
+# Milestone 5 — grounded generation
+GROQ_MODEL = "llama-3.3-70b-versatile"
+# If the closest chunk is farther than this cosine distance, the corpus
+# almost certainly doesn't cover the question — decline rather than letting
+# the LLM improvise from its training knowledge.
+RELEVANCE_THRESHOLD = 0.65
+NO_ANSWER = "I don't have enough information on that."
+
 MODEL_MAX_TOKENS = 256
 
 # The 10 sources from planning.md → Documents.  (name, url)
@@ -167,8 +173,8 @@ def clean_html(raw: str, is_html: bool) -> list[str]:
     else:
         text = raw
 
-    text = html.unescape(text)          # &amp; -> &, &#39; -> '
-    text = text.replace("\xa0", " ")    # &nbsp; -> normal space
+    text = html.unescape(text)          
+    text = text.replace("\xa0", " ")    
 
     paragraphs: list[str] = []
     for block in text.split("\n\n"):
@@ -176,10 +182,7 @@ def clean_html(raw: str, is_html: bool) -> list[str]:
         block = re.sub(r"\s*\n\s*", " ", block).strip()
         if not block or _JUNK_LINE.match(block):
             continue
-        # Keep only prose-like paragraphs. Menu/link fragments that aren't
-        # wrapped in <nav> ("Austin", "View all", "Rent Better", "Contact")
-        # are short and have no sentence punctuation, so this drops them
-        # while keeping real sentences and headings like "...in the U.S.".
+    
         word_count = len(block.split())
         has_sentence = bool(re.search(r"[.!?]", block))
         if word_count < 8 and not has_sentence:
@@ -219,7 +222,7 @@ def load_documents() -> dict[str, list[str]]:
         if paragraphs:
             docs[path.stem] = paragraphs
 
-    # Any extra local files placed directly in documents/ (txt/md/pdf/html).
+    
     for path in sorted(DOCUMENTS_DIR.glob("*")):
         if not path.is_file():
             continue
@@ -288,7 +291,6 @@ def chunk_text(paragraphs: list[str], source: str, tokenizer,
     overflow chunk_size; the last `overlap` tokens' worth of trailing
     paragraphs seed the next chunk. A lone oversized paragraph is split by
     words first."""
-    # Build (text, token_count) units, splitting any oversized paragraph.
     units: list[tuple[str, int]] = []
     for para in paragraphs:
         n = _token_len(para, tokenizer)
@@ -315,7 +317,7 @@ def chunk_text(paragraphs: list[str], source: str, tokenizer,
             text=text,
         ))
         index += 1
-        # Carry trailing units (up to `overlap` tokens) into the next chunk.
+        
         kept: list[tuple[str, int]] = []
         kept_tokens = 0
         for t, n in reversed(current):
@@ -348,8 +350,6 @@ def preview_document(name: str, paragraphs: list[str], max_chars: int = 1500) ->
 def preview_chunks(chunks: list[Chunk], n: int = 5) -> None:
     if not chunks:
         return
-    # Evenly spaced across the corpus so the sample is representative,
-    # not just the first few chunks of the first document.
     step = max(1, len(chunks) // n)
     sample = chunks[::step][:n]
     print("\n" + "=" * 70)
@@ -380,7 +380,6 @@ def run_ingest() -> None:
     for name, paragraphs in docs.items():
         (CLEAN_DIR / f"{name}.txt").write_text("\n\n".join(paragraphs), encoding="utf-8")
 
-    # Inspect one cleaned document before chunking.
     first = next(iter(docs))
     preview_document(first, docs[first])
 
@@ -417,17 +416,8 @@ def run_ingest() -> None:
 
 
 # --- 6. Embedding + vector store (Milestone 4) ----------------------------- #
-#
-# Pipeline diagram stages 3 & 4:
-#   chunks.jsonl --[all-MiniLM-L6-v2]--> embeddings --[ChromaDB]--> index
-#                                                    query --[top-k]--> chunks
-#
-# sentence-transformers and chromadb are imported lazily inside these functions
-# so the ingestion stage above still runs even if the vector-store libraries
-# aren't importable yet.
 
-_model = None  # cache the SentenceTransformer so we load it only once
-
+_model = None  
 
 def get_model():
     """Load all-MiniLM-L6-v2 once (local, no API key, no rate limits)."""
@@ -458,8 +448,6 @@ def run_index() -> None:
     model = get_model()
 
     print(f"Embedding {len(chunks)} chunks ...")
-    # normalize_embeddings=True pairs with the collection's cosine space so
-    # the distances ChromaDB returns are cosine distances (0 = identical).
     embeddings = model.encode(
         [c["text"] for c in chunks],
         normalize_embeddings=True,
@@ -467,7 +455,6 @@ def run_index() -> None:
     ).tolist()
 
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    # Rebuild from scratch so re-running never duplicates or stales records.
     try:
         client.delete_collection(COLLECTION_NAME)
     except Exception:
@@ -498,7 +485,6 @@ def retrieve(query: str, k: int = TOP_K) -> list[dict]:
     collection = client.get_collection(COLLECTION_NAME)
     res = collection.query(query_embeddings=query_embedding, n_results=k)
 
-    # Chroma returns parallel lists wrapped one level deep (one per query).
     results = []
     for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0],
                                res["distances"][0]):
@@ -511,7 +497,6 @@ def retrieve(query: str, k: int = TOP_K) -> list[dict]:
     return results
 
 
-# Three of the five evaluation-plan queries from planning.md.
 TEST_QUERIES = [
     "What is a realistic monthly rent range for off-campus student housing, "
     "and what costs beyond base rent should I budget for?",
@@ -536,22 +521,155 @@ def run_test(k: int = TOP_K) -> None:
             print(f"  {snippet}{'...' if len(r['text']) > 280 else ''}")
 
 
-# --- 7. Command dispatch --------------------------------------------------- #
+# --- 7. Grounded generation (Milestone 5) ---------------------------------- #
+#
+# Pipeline diagram stage 5:
+#   question --[retrieve]--> chunks --[Groq llama-3.3-70b]--> grounded answer
+#
+# Grounding is enforced two ways, neither of which trusts the LLM's goodwill:
+#   1. A relevance gate — if retrieval finds nothing close enough, we return
+#      the "not enough information" answer WITHOUT calling the LLM at all, so
+#      it can't improvise from training knowledge.
+#   2. A strict system prompt that forbids outside knowledge and mandates the
+#      exact fallback sentence.
+# Source attribution is added programmatically from retrieval metadata — it is
+# never left to the model to invent.
+
+SYSTEM_PROMPT = (
+    "You are an assistant that answers questions about off-campus student "
+    "housing. You must answer using ONLY the information in the context "
+    "documents provided by the user. Follow these rules strictly:\n"
+    "1. Use only facts stated in the context. Never use outside or prior "
+    "knowledge, and never guess or fill in gaps.\n"
+    f"2. If the context does not contain enough information to answer, reply "
+    f"with exactly this sentence and nothing else: \"{NO_ANSWER}\"\n"
+    "3. Be concise and factual. Do not invent sources, numbers, or details "
+    "that are not in the context."
+)
+
+
+def _build_context(chunks: list[dict]) -> str:
+    """Format retrieved chunks as numbered, source-labeled blocks so the
+    model sees exactly which document each fact came from."""
+    return "\n\n".join(
+        f"[Document {i} — source: {c['source']}]\n{c['text']}"
+        for i, c in enumerate(chunks, 1)
+    )
+
+
+def _unique_sources(chunks: list[dict]) -> list[str]:
+    """Distinct source names in retrieval order (for attribution)."""
+    seen: list[str] = []
+    for c in chunks:
+        if c["source"] not in seen:
+            seen.append(c["source"])
+    return seen
+
+
+def generate_answer(question: str, chunks: list[dict]) -> str:
+    """Call Groq with the retrieved context and the grounding system prompt."""
+    from dotenv import load_dotenv
+    from groq import Groq
+
+    load_dotenv()
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key or api_key == "your_key_here":
+        raise SystemExit("Set GROQ_API_KEY in .env (see .env.example).")
+
+    user_message = (
+        f"Context documents:\n\n{_build_context(chunks)}\n\n"
+        f"Question: {question}\n\n"
+        "Answer using only the context documents above."
+    )
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        temperature=0,          # deterministic, no creative drift
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def ask(question: str, k: int = TOP_K) -> dict:
+    """End-to-end: retrieve -> (relevance gate) -> generate -> attribute.
+
+    Returns {"answer": str, "sources": list[str], "chunks": list[dict]}.
+    """
+    chunks = retrieve(question, k=k)
+
+    # Relevance gate: nothing close enough -> decline without calling the LLM.
+    if not chunks or chunks[0]["distance"] > RELEVANCE_THRESHOLD:
+        return {"answer": NO_ANSWER, "sources": [], "chunks": chunks}
+
+    answer = generate_answer(question, chunks)
+
+    # If the model itself declined, don't attach misleading sources.
+    sources = [] if answer.strip() == NO_ANSWER else _unique_sources(chunks)
+    return {"answer": answer, "sources": sources, "chunks": chunks}
+
+
+# --- 8. Interface (Gradio web UI) ------------------------------------------ #
+
+def handle_query(question: str):
+    question = (question or "").strip()
+    if not question:
+        return "Please enter a question.", ""
+    result = ask(question)
+    sources = "\n".join(f"• {s}" for s in result["sources"]) or "(no sources)"
+    return result["answer"], sources
+
+
+def run_ui() -> None:
+    import gradio as gr
+
+    with gr.Blocks(title="The Unofficial Guide — Off-Campus Housing") as demo:
+        gr.Markdown(
+            "# The Unofficial Guide\n"
+            "Ask about off-campus student housing — pricing, roommates, "
+            "safety, and choosing a place. Answers come only from the "
+            "collected guides; if they don't cover your question, the system "
+            "will say so."
+        )
+        inp = gr.Textbox(label="Your question",
+                         placeholder="e.g. How much should I budget per month?")
+        btn = gr.Button("Ask", variant="primary")
+        answer = gr.Textbox(label="Answer", lines=8)
+        sources = gr.Textbox(label="Retrieved from", lines=4)
+        btn.click(handle_query, inputs=inp, outputs=[answer, sources])
+        inp.submit(handle_query, inputs=inp, outputs=[answer, sources])
+
+    demo.launch()
+
+
+# --- 9. Command dispatch --------------------------------------------------- #
 
 def main() -> None:
-    # Windows consoles default to cp1252 and choke on characters like "→"
-    # that appear in page/chunk text; force UTF-8 output.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "ui"
 
-    if cmd == "ingest":          # Milestone 3 only
+    if cmd == "ui":              # Milestone 5: launch the Gradio web UI (default)
+        run_ui()
+    elif cmd == "ingest":        # Milestone 3 only
         run_ingest()
     elif cmd == "index":         # Milestone 4: embed + store
         run_index()
     elif cmd == "test":          # Milestone 4: retrieval sanity check
         run_test()
-    elif cmd == "query":         # ad-hoc: python app.py query "your question"
+    elif cmd == "ask":           # Milestone 5: end-to-end answer in the terminal
+        if len(sys.argv) < 3:
+            raise SystemExit('Usage: python app.py ask "your question here"')
+        result = ask(sys.argv[2])
+        print("\nANSWER:\n" + result["answer"])
+        print("\nSOURCES:")
+        for s in result["sources"]:
+            print(f"  • {s}")
+        if not result["sources"]:
+            print("  (none)")
+    elif cmd == "query":         # retrieval-only debug view
         if len(sys.argv) < 3:
             raise SystemExit('Usage: python app.py query "your question here"')
         for r in retrieve(sys.argv[2]):
@@ -565,7 +683,7 @@ def main() -> None:
         run_test()
     else:
         raise SystemExit(f"Unknown command '{cmd}'. "
-                         "Use: ingest | index | test | query | all")
+                         "Use: ui | ingest | index | test | ask | query | all")
 
 
 if __name__ == "__main__":
