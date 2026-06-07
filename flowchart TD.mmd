@@ -1,0 +1,11 @@
+flowchart TD
+    A["1. Document Ingestion<br/>requests + BeautifulSoup<br/>(scrape 10 source URLs)"]
+    B["2. Chunking<br/>custom chunk_text()<br/>500-token chunks, 75 overlap"]
+    C["3. Embedding + Vector Store<br/>all-MiniLM-L6-v2<br/>stored in ChromaDB"]
+    D["4. Retrieval<br/>ChromaDB similarity search<br/>top-k = 4–5 chunks"]
+    E["5. Generation + Interface<br/>Claude API<br/>CLI / Streamlit chat"]
+
+    Q(["User question"]) --> D
+
+    A --> B --> C --> D --> E
+    E --> ANS(["Cited answer"])
